@@ -1,0 +1,15 @@
+# Variables d'environnement (secrets)
+.env
+# Environnement virtuel Python
+venv/
+.venv/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+notes.md

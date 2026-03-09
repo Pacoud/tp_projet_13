@@ -1,0 +1,13 @@
+# --- Dépendances du projet : Extracteur de données de formulaires PDF ---
+
+# Client officiel OpenAI (compatible Azure OpenAI) avec support des Structured Outputs
+openai>=1.40.0
+
+# PyMuPDF : extraction rapide et fiable du texte brut depuis les fichiers PDF
+PyMuPDF>=1.24.0
+
+# Pydantic v2 : validation de données et définition de schémas typés
+pydantic>=2.0.0
+
+# python-dotenv : chargement des variables d'environnement depuis un fichier .env
+python-dotenv>=1.0.0
