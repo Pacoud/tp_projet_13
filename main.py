@@ -2,6 +2,7 @@
 Extracteur de données de formulaires PDF
 =========================================
 MVP qui lit un fichier PDF, en extrait le texte brut avec PyMuPDF,
+détecte automatiquement le type de document (facture ou autre),
 puis utilise Azure OpenAI (gpt-4o-mini) avec les Structured Outputs
 pour extraire des données structurées validées par Pydantic.
 """
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 from pydantic import BaseModel, Field
 from typing import Optional
+import unicodedata
 
 import threading
 
@@ -111,10 +113,30 @@ AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
+# Limite de caractères envoyés à l'API pour éviter le dépassement de tokens
+LIMITE_CARACTERES = 50000
+
 
 # =============================================================================
-# 2. Définition du modèle Pydantic (schéma des données à extraire)
+# 2. Définition des modèles Pydantic
 # =============================================================================
+
+class TypeDocument(BaseModel):
+    """
+    Schéma Pydantic utilisé pour la détection du type de document.
+    Un premier appel API léger détermine si le PDF est une facture ou non.
+    """
+    est_facture: bool = Field(
+        description="True si le document est une facture commerciale, False sinon."
+    )
+    type_detecte: Optional[str] = Field(
+        default=None,
+        description=(
+            "Type du document détecté en français, ex: 'facture', 'contrat', "
+            "'rapport', 'déclaration fiscale', 'bulletin de paie', 'autre'."
+        )
+    )
+
 
 class DonneesFacture(BaseModel):
     """
@@ -137,9 +159,46 @@ class DonneesFacture(BaseModel):
         default=None,
         description="Montant total TTC de la facture, en nombre décimal."
     )
+    devise: Optional[str] = Field(
+        default=None,
+        description="Devise du montant (ex: 'EUR', 'USD', 'GBP'). Si non précisée, renvoyer null."
+    )
     date: Optional[str] = Field(
         default=None,
         description="Date de la facture au format texte (ex: '15/01/2025')."
+    )
+
+
+class AnalyseGenerique(BaseModel):
+    """
+    Schéma Pydantic pour l'analyse de tout document qui n'est pas une facture.
+
+    Les champs couvrent les informations généralement présentes dans
+    n'importe quel document textuel (rapport, contrat, déclaration, etc.).
+    """
+
+    titre_document: Optional[str] = Field(
+        default=None,
+        description="Titre ou intitulé principal du document."
+    )
+    auteur_ou_organisme: Optional[str] = Field(
+        default=None,
+        description="Nom de l'auteur, de l'organisme ou de l'entité émettrice du document."
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date mentionnée dans le document (date d'émission, de signature, etc.)."
+    )
+    resume_contenu: Optional[str] = Field(
+        default=None,
+        description="Résumé concis (2-4 phrases) du contenu principal du document."
+    )
+    points_cles: Optional[str] = Field(
+        default=None,
+        description=(
+            "Points clés ou informations importantes extraits du document "
+            "(montants, noms, références, obligations, etc.), listés en texte libre."
+        )
     )
 
 
@@ -151,7 +210,13 @@ def extraire_texte_pdf(chemin_pdf: str) -> str:
     """
     Lit un fichier PDF avec PyMuPDF et retourne le texte brut de toutes
     les pages concaténées.
+    Gère les cas : fichier introuvable, extension invalide, PDF protégé,
+    et PDF scanné (image sans texte).
     """
+    # --- Validation du chemin ---
+    if not chemin_pdf.lower().endswith('.pdf'):
+        raise ValueError(f"Le fichier doit avoir l'extension .pdf : '{chemin_pdf}'")
+
     if not os.path.isfile(chemin_pdf):
         raise FileNotFoundError(f"Le fichier PDF est introuvable : '{chemin_pdf}'")
 
@@ -160,6 +225,14 @@ def extraire_texte_pdf(chemin_pdf: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Impossible d'ouvrir le fichier PDF : {e}")
 
+    # --- Détection d'un PDF protégé par mot de passe ---
+    if document.needs_pass:
+        document.close()
+        raise PermissionError(
+            "Le fichier PDF est protégé par un mot de passe. "
+            "Veuillez fournir un PDF non protégé."
+        )
+
     texte_complet = ""
     for numero_page, page in enumerate(document, start=1):
         texte_page = page.get_text("text")
@@ -167,23 +240,90 @@ def extraire_texte_pdf(chemin_pdf: str) -> str:
 
     document.close()
 
+    # --- Nettoyage du texte extrait ---
+    # Supprime les octets nuls parasites (présents dans les PDFs encodés en UTF-16)
+    # qui provoquent des séquences illisibles comme '0e9' à la place de 'é'.
+    texte_complet = texte_complet.replace('\x00', '')
+    # Normalisation Unicode NFC : recompose les caractères décomposés
+    texte_complet = unicodedata.normalize('NFC', texte_complet)
+
+    # --- Détection d'un PDF scanné (image sans texte exploitable) ---
     if not texte_complet.strip():
-        console.print(
-            "[bold yellow]⚠  Attention :[/bold yellow] Aucun texte extrait. "
-            "Le fichier est peut-être un scan (image)."
+        raise RuntimeError(
+            "Aucun texte n'a pu être extrait du PDF. "
+            "Le fichier est probablement un scan (image). "
+            "Utilisez un outil d'OCR pour convertir les images en texte."
         )
 
     return texte_complet
 
 
 # =============================================================================
-# 4. Fonction d'extraction structurée via Azure OpenAI (Structured Outputs)
+# 4. Fonction de détection du type de document
 # =============================================================================
 
-def extraire_donnees_structurees(texte_brut: str) -> DonneesFacture:
+def detecter_type_document(texte_brut: str) -> TypeDocument:
+    """
+    Effectue un premier appel léger à l'API Azure OpenAI pour déterminer
+    si le document est une facture ou un autre type de document.
+    Retourne un objet TypeDocument avec un booléen et le type détecté.
+    """
+    client = AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+
+    prompt_detection = (
+        "Tu es un assistant expert en classification de documents. "
+        "On te fournit le texte brut extrait d'un PDF. "
+        "Ta seule mission est de déterminer si ce document est une facture commerciale ou non, "
+        "et d'indiquer quel type de document il s'agit.\n\n"
+        "RÈGLES :\n"
+        "- Une facture contient généralement : un numéro de facture, un montant TTC/HT, "
+        "un client, une date d'échéance, des lignes d'articles ou de services.\n"
+        "- Si tu n'es pas sûr, indique est_facture = false.\n"
+        "- Pour type_detecte, sois précis : 'facture', 'contrat', 'rapport annuel', "
+        "'déclaration fiscale', 'bulletin de paie', 'relevé bancaire', 'autre', etc."
+    )
+
+    try:
+        completion = client.beta.chat.completions.parse(
+            model=AZURE_OPENAI_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": prompt_detection},
+                {"role": "user", "content": (
+                    "Voici le texte brut extrait d'un PDF. "
+                    "Classifie ce document :\n\n"
+                    # On envoie le début ET la fin du texte pour une meilleure détection
+                    f"{texte_brut[:3000]}\n[...]\n{texte_brut[-1000:]}"
+                )},
+            ],
+            response_format=TypeDocument,
+            temperature=0,
+        )
+
+        resultat = completion.choices[0].message.parsed
+        if resultat is None:
+            # En cas d'échec, on suppose que ce n'est pas une facture
+            return TypeDocument(est_facture=False, type_detecte="inconnu")
+        return resultat
+
+    except Exception as e:
+        raise RuntimeError(f"Erreur lors de la détection du type de document : {e}")
+
+
+# =============================================================================
+# 5. Fonction d'extraction structurée via Azure OpenAI (Structured Outputs)
+# =============================================================================
+
+def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
     """
     Envoie le texte brut extrait du PDF à l'API Azure OpenAI et utilise
     les Structured Outputs pour obtenir un objet Pydantic validé.
+
+    - Si est_facture=True  : retourne un objet DonneesFacture
+    - Si est_facture=False : retourne un objet AnalyseGenerique
     """
     if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
                 AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME]):
@@ -198,29 +338,56 @@ def extraire_donnees_structurees(texte_brut: str) -> DonneesFacture:
         api_version=AZURE_OPENAI_API_VERSION,
     )
 
-    prompt_systeme = (
-        "Tu es un assistant spécialisé dans l'extraction de données à partir "
-        "de documents textuels. On te fournit le texte brut extrait d'un PDF "
-        "de facture. Tu dois extraire les informations demandées.\n\n"
-        "RÈGLES IMPORTANTES :\n"
-        "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
-        "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
-        "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
-        "- Pour le montant, renvoie uniquement la valeur numérique (sans symbole €).\n"
-    )
+    if est_facture:
+        # --- Chemin FACTURE ---
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'extraction de données à partir "
+            "de documents textuels. On te fournit le texte brut extrait d'un PDF "
+            "de facture. Tu dois extraire les informations demandées.\n\n"
+            "RÈGLES IMPORTANTES :\n"
+            "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
+            "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
+            "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
+            "- Pour le montant, renvoie uniquement la valeur numérique (sans symbole €).\n"
+        )
+        # Troncature si le texte est trop long pour éviter le dépassement de tokens
+        texte_a_envoyer = texte_brut[:LIMITE_CARACTERES]
+        message_utilisateur = (
+            "Voici le texte brut extrait d'une facture PDF. "
+            "Extrais les données demandées :\n\n"
+            f"{texte_a_envoyer}"
+        )
+        schema = DonneesFacture
+
+    else:
+        # --- Chemin GÉNÉRIQUE ---
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'analyse de documents textuels. "
+            "On te fournit le texte brut extrait d'un PDF qui n'est pas une facture. "
+            "Tu dois extraire les informations clés de ce document.\n\n"
+            "RÈGLES IMPORTANTES :\n"
+            "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
+            "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
+            "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
+            "- Pour le résumé et les points clés, sois concis et factuel.\n"
+        )
+        # Troncature si le texte est trop long pour éviter le dépassement de tokens
+        texte_a_envoyer = texte_brut[:LIMITE_CARACTERES]
+        message_utilisateur = (
+            "Voici le texte brut extrait d'un document PDF. "
+            "Extrais les informations clés :\n\n"
+            f"{texte_a_envoyer}"
+        )
+        schema = AnalyseGenerique
 
     try:
         completion = client.beta.chat.completions.parse(
             model=AZURE_OPENAI_DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": prompt_systeme},
-                {"role": "user", "content": (
-                    "Voici le texte brut extrait d'une facture PDF. "
-                    "Extrais les données demandées :\n\n"
-                    f"{texte_brut}"
-                )},
+                {"role": "user", "content": message_utilisateur},
             ],
-            response_format=DonneesFacture,
+            response_format=schema,
             temperature=0,
         )
 
@@ -239,11 +406,14 @@ def extraire_donnees_structurees(texte_brut: str) -> DonneesFacture:
 
 
 # =============================================================================
-# 5. Affichage des résultats dans un tableau Rich
+# 6. Affichage des résultats dans un tableau Rich
 # =============================================================================
 
-def afficher_resultats(donnees: DonneesFacture, chemin_pdf: str):
-    """Affiche les données extraites dans un joli tableau Rich."""
+def afficher_resultats(donnees, chemin_pdf: str, est_facture: bool):
+    """
+    Affiche les données extraites dans un joli tableau Rich.
+    L'affichage s'adapte selon que le document est une facture ou non.
+    """
 
     console.print()
     console.print(Rule("[bold green]Résultats de l'extraction[/bold green]", style="green"))
@@ -264,13 +434,27 @@ def afficher_resultats(donnees: DonneesFacture, chemin_pdf: str):
     def val(v):
         return str(v) if v is not None else "[dim italic]Non trouvé[/dim italic]"
 
-    table.add_row("👤  Nom client",   val(donnees.nom_client))
-    table.add_row("✉  E-mail",        val(donnees.email_client))
-    table.add_row("💶  Montant TTC",
-                  f"[bold green]{donnees.montant_total:,.2f} €[/bold green]"
-                  if donnees.montant_total is not None
-                  else "[dim italic]Non trouvé[/dim italic]")
-    table.add_row("📅  Date",         val(donnees.date))
+    if est_facture:
+        # --- Affichage spécifique FACTURE ---
+        table.add_row("👤  Nom client",   val(donnees.nom_client))
+        table.add_row("✉  E-mail",        val(donnees.email_client))
+        # Affichage du montant avec la devise détectée par l'IA
+        symbole_devise = {"EUR": "€", "USD": "$", "GBP": "£"}.get(
+            (donnees.devise or "").upper(), donnees.devise or "€"
+        )
+        table.add_row("💶  Montant TTC",
+                      f"[bold green]{donnees.montant_total:,.2f} {symbole_devise}[/bold green]"
+                      if donnees.montant_total is not None
+                      else "[dim italic]Non trouvé[/dim italic]")
+        table.add_row("📅  Date",         val(donnees.date))
+
+    else:
+        # --- Affichage générique ---
+        table.add_row("📄  Titre",              val(donnees.titre_document))
+        table.add_row("🏢  Auteur / Organisme", val(donnees.auteur_ou_organisme))
+        table.add_row("📅  Date",               val(donnees.date))
+        table.add_row("📝  Résumé",             val(donnees.resume_contenu))
+        table.add_row("🔑  Points clés",        val(donnees.points_cles))
 
     console.print(Padding(table, (0, 4)))
     console.print()
@@ -288,7 +472,7 @@ def afficher_resultats(donnees: DonneesFacture, chemin_pdf: str):
 
 
 # =============================================================================
-# 6. Point d'entrée principal
+# 7. Point d'entrée principal
 # =============================================================================
 
 def main():
@@ -317,6 +501,16 @@ def main():
 
     chemin_pdf = sys.argv[1]
 
+    # --- Vérification anticipée des variables d'environnement Azure ---
+    if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
+                AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME]):
+        console.print(
+            "[bold red]❌  Erreur de configuration :[/bold red] "
+            "Les variables d'environnement Azure OpenAI ne sont pas toutes "
+            "configurées. Vérifiez votre fichier .env."
+        )
+        sys.exit(1)
+
     # --- Étape 1 : Extraction du texte brut du PDF ---
     try:
         texte_brut = run_with_rect(
@@ -325,6 +519,12 @@ def main():
         )
     except FileNotFoundError as e:
         console.print(f"\n[bold red]❌  Erreur :[/bold red] {e}")
+        sys.exit(1)
+    except ValueError as e:
+        console.print(f"\n[bold red]❌  Erreur :[/bold red] {e}")
+        sys.exit(1)
+    except PermissionError as e:
+        console.print(f"\n[bold red]🔒  Erreur :[/bold red] {e}")
         sys.exit(1)
     except RuntimeError as e:
         console.print(f"\n[bold red]❌  Erreur lecture PDF :[/bold red] {e}")
@@ -335,23 +535,58 @@ def main():
         f"[cyan]{len(texte_brut)}[/cyan] caractères sur [cyan]{chemin_pdf}[/cyan]"
     )
 
+    # --- Avertissement si le texte est très long (sera tronqué) ---
+    if len(texte_brut) > LIMITE_CARACTERES:
+        console.print(
+            f"[bold yellow]⚠  Attention :[/bold yellow] Le texte fait "
+            f"[cyan]{len(texte_brut)}[/cyan] caractères, il sera tronqué à "
+            f"[cyan]{LIMITE_CARACTERES}[/cyan] pour l'envoi à l'API."
+        )
+
     # --- Aperçu du texte extrait ---
     apercu = texte_brut[:400].strip().replace("\n", " ")
+    if apercu:
+        console.print(
+            Panel(
+                f"[dim]{apercu}…[/dim]",
+                title="[bold]Aperçu du texte extrait[/bold]",
+                border_style="dim",
+                padding=(0, 2),
+            )
+        )
+    console.print()
+
+    # --- Étape 2 : Détection du type de document ---
+    try:
+        type_doc = run_with_rect(
+            "Détection du type de document",
+            detecter_type_document, texte_brut
+        )
+    except RuntimeError as e:
+        console.print(f"\n[bold red]❌  Erreur détection :[/bold red] {e}")
+        sys.exit(1)
+
+    # Affichage du type détecté
+    if type_doc.est_facture:
+        badge = "[bold green]🧾  Facture[/bold green]"
+    else:
+        badge = f"[bold yellow]📂  {type_doc.type_detecte or 'Document générique'}[/bold yellow]"
+
     console.print(
         Panel(
-            f"[dim]{apercu}…[/dim]",
-            title="[bold]Aperçu du texte extrait[/bold]",
+            f"Type de document détecté : {badge}",
             border_style="dim",
+            expand=False,
             padding=(0, 2),
         )
     )
     console.print()
 
-    # --- Étape 2 : Extraction structurée via Azure OpenAI ---
+    # --- Étape 3 : Extraction structurée via Azure OpenAI ---
     try:
         donnees = run_with_rect(
             "Analyse par Azure OpenAI  (gpt-4o)",
-            extraire_donnees_structurees, texte_brut
+            extraire_donnees_structurees, texte_brut, type_doc.est_facture
         )
     except ValueError as e:
         console.print(f"\n[bold red]❌  Erreur de configuration :[/bold red] {e}")
@@ -362,8 +597,8 @@ def main():
 
     console.print("[bold green]✔[/bold green]  Réponse reçue de l'API Azure OpenAI")
 
-    # --- Étape 3 : Affichage des résultats ---
-    afficher_resultats(donnees, chemin_pdf)
+    # --- Étape 4 : Affichage des résultats ---
+    afficher_resultats(donnees, chemin_pdf, type_doc.est_facture)
 
 
 if __name__ == "__main__":
