@@ -11,3 +11,6 @@ pydantic>=2.0.0
 
 # python-dotenv : chargement des variables d'environnement depuis un fichier .env
 python-dotenv>=1.0.0
+
+# rich : interface terminal esthétique (spinners, couleurs, tableaux, panneaux)
+rich>=13.0.0

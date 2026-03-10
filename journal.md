@@ -38,4 +38,26 @@ Génère un code propre, commenté et modulaire.
 **Apprentissage :**
 J'ai compris l'importance d'utiliser `client.beta.chat.completions.parse` d'OpenAI avec Pydantic. Cela force le LLM à répondre dans un format JSON strict et évite d'avoir à faire du "prompt engineering" hasardeux ou de parser péniblement du texte libre.
 
+## Session 2 - Objectif : Paufiner le code, embellir le visuel
 
+**Prompt utilisé :**
+Premier prompt-
+est ce que l'on peut travailler l'esthétique pour l'utilisateur lorsqu'il lance l'execution du script python ? qu'il voie un écran de chargement de quelque sorte
+
+Deuxième prompt-
+en fait pour le spinner je voulais plutot un rectangle de ligne dicontinue en mouvement, également dans le tableau de l'affichage des valeurs, l'email ne s'affiche pas correctement, les dimensions de sa case ne sont pas conformes avec les cases des autres données
+
+Troisième prompt-
+Je voulais comprendre ou était géré le spinner, je lui ai demandé de me l'expliquer.
+
+**Problèmes anticipés & Solutions :**
+Tout en demandant à l'IA d'embellir le code, j'ai fait attention à la cohérence de ce qu'elle me rendait, cela dit elle m'a donné en premier lieu un affichage en tableau, ce que je n'avais pas demandé, il est somme toute bien en globalité mais le mail est mal affiché je vais régler ce problème. Le spinner était pas à mon gout je lui ai demandé de le changer pour etre plus esthétique.
+_Solution appliquée :_ l'intelligence artificielle a bien compris ma demande et a généré un spinner propre et esthétique meme si j'ai du repasser derrière en re-modifiant le spinner par exemple.
+
+**Apprentissage :**
+j'ai appris à mieux communiquer avec l'IA, mieux collaborer avec, notamment lorsque j'ai du modifier le fichier main.py, l'IA m'a précisément communiqué ce qui était à changer et d'ailleurs c'était déjà bien commenté, cela m'a aidé et a renforcé l'importance que j'accorde aux commentaires de code.
+
+## Session 3 - Objectif : Gérer les erreurs potentielles et garder des cas inhabituels
+
+Premier Prompt-
+(Je ne vais pas dire à l'IA de tout implémenter toute seule, je vais déjà lui demander de me guider)
