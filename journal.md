@@ -4,12 +4,11 @@
 "Agis comme un développeur Python expert. > Je dois créer le MVP d'un "Extracteur de données de formulaires". L'objectif est de lire un fichier PDF, d'en extraire le texte brut, puis d'utiliser un LLM pour extraire les données spécifiques dans un format JSON strict.
 
 Voici mes choix techniques obligatoires :
+-PyMuPDF (fitz) pour l'extraction du texte brut du PDF.
 
-PyMuPDF (fitz) pour l'extraction du texte brut du PDF.
+-Pydantic pour définir le schéma de données attendu et valider les types.
 
-Pydantic pour définir le schéma de données attendu et valider les types.
-
-Azure OpenAI (modèle gpt-4o-mini) en utilisant la fonctionnalité native "Structured Outputs" (via client.beta.chat.completions.parse avec Pydantic).
+-Azure OpenAI (modèle gpt-4o-mini) en utilisant la fonctionnalité native "Structured Outputs" (via client.beta.chat.completions.parse avec Pydantic).
 
 Ce que tu dois générer :
 
@@ -73,10 +72,13 @@ Initiallement je pars d'un code ou l'IA ne prends pas vraiment en compte d'autre
 L'IA renvoie des résultats avec des coquilles car elle ne prend pas en compte les accents et caractères spéciaux, je dois régler cela.
 Problème avec les caractères spéciaux: Je remarque que l'IA traite mal les caracères spéciaux lors de son analyse, un prétraitement du texte devrait etre fait avant de l'envoyer au LLM
 
-_Solutions_
 _Problème du type de document_ : le nouveau code permet d'avoir un traitement par situation et par type de document
 
 _Problème des accents et caractères spéciaux_ : Un prétraitement manuel des infos du document permet à l'IA de travailler avec un nouveau document propre et lisible.(suppression des octets nuls et normalisation des accents)
+
+**Apprentissage :**
+
+J'ai acquis des notions nouvelles pour ce qui est de la gestion des erreurs et des cas particuliers, notamment comment gérer les pdf protégés par mdp, les pdf trop volumineux, les pdf sans texte, etc. Et ce sous l'oeil de l'IA qui m'a aiguillé vers des solutions auxquelles je n'aurais jamais pensé.
 
 ## Session 4 - Objectif : Améliorer la gestion des erreurs et des cas particuliers
 
@@ -86,7 +88,11 @@ maitnenant peux tu analyser le code et y détecter d'éventuelles failles ou sit
 ''L'IA me cite des cas de failles critiques''
 
 Deuxième Prompt-
-peux tu implémenter dans un premier temps toutes failles et cas limites critiques et moyennes citées au dessus ?
+peux tu implémenter dans un premier temps toutes failles et cas limites critiques et moyennes citées en dessous ?
+
+Troisième Prompt -
+est ce que tu peux vérifier si tout marche et que les solutions apportées fonctionnent ?
+(Certains cas limites pas totalement implémentés, je repasse dessus)
 **Problèmes anticipés et solutions**
 Si le pdf est une image sans texte, alors le code renvoie un résultat inutile et trompeur car tous les champs sont à None, il faudrait plutôt afficher un message d'erreur et quitter.
 
@@ -110,3 +116,5 @@ La valeur renvoyée du montant est quoi qu'il en soit toujours exprimée en euro
 L'utilisateur peut passer n'importe quel argument en chemin relatif, ça peut etre risqué, il n'y a pas de validation
 
 _Solution_ implémenter une validation robuste du chemin rentré par l'utilisateur
+
+**Apprentissage** :

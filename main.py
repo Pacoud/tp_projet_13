@@ -11,9 +11,11 @@ import os
 import sys
 import time
 
+import json
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from openai import AzureOpenAI
+from groq import Groq
 from pydantic import BaseModel, Field
 from typing import Optional
 import unicodedata
@@ -113,8 +115,13 @@ AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
+# --- Configuration Groq (API de secours) ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
+
 # Limite de caractères envoyés à l'API pour éviter le dépassement de tokens
 LIMITE_CARACTERES = 50000
+LIMITE_CARACTERES_GROQ = 25000  # Groq a des limites plus basses
 
 
 # =============================================================================
@@ -310,7 +317,9 @@ def detecter_type_document(texte_brut: str) -> TypeDocument:
         return resultat
 
     except Exception as e:
-        raise RuntimeError(f"Erreur lors de la détection du type de document : {e}")
+        # --- Fallback Groq pour la détection ---
+        console.print(f"[bold yellow]⚠  Azure échoué pour la détection, basculement vers Groq...[/bold yellow]")
+        return _detecter_type_document_groq(texte_brut)
 
 
 # =============================================================================
@@ -402,11 +411,128 @@ def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
         return resultat
 
     except Exception as e:
-        raise RuntimeError(f"Erreur lors de l'appel à l'API Azure OpenAI : {e}")
+        # --- Fallback Groq pour l'extraction ---
+        console.print(f"[bold yellow]⚠  Azure échoué pour l'extraction, basculement vers Groq...[/bold yellow]")
+        return _extraire_donnees_groq(texte_brut, est_facture)
 
 
 # =============================================================================
-# 6. Affichage des résultats dans un tableau Rich
+# 6. Fonctions de secours Groq (Llama 3)
+# =============================================================================
+
+def _get_groq_client() -> Groq:
+    """Crée et retourne un client Groq. Lève une erreur si la clé n'est pas configurée."""
+    if not GROQ_API_KEY or GROQ_API_KEY == "VOTRE_CLE_GROQ_ICI":
+        raise RuntimeError(
+            "L'API Azure OpenAI a échoué et l'API de secours Groq n'est pas configurée. "
+            "Ajoutez votre GROQ_API_KEY dans le fichier .env "
+            "(obtenez-la sur https://console.groq.com/keys)."
+        )
+    return Groq(api_key=GROQ_API_KEY)
+
+
+def _detecter_type_document_groq(texte_brut: str) -> TypeDocument:
+    """
+    Fallback : détecte le type de document via Groq / Llama 3.
+    Utilise le mode JSON et parse manuellement le résultat.
+    """
+    client = _get_groq_client()
+
+    prompt_detection = (
+        "Tu es un assistant expert en classification de documents. "
+        "On te fournit le texte brut extrait d'un PDF. "
+        "Détermine si ce document est une facture commerciale ou non.\n\n"
+        "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
+        '{"est_facture": true/false, "type_detecte": "facture/contrat/rapport/autre"}\n\n'
+        "RÈGLES :\n"
+        "- Une facture contient : numéro de facture, montant TTC/HT, client, date.\n"
+        "- Si tu n'es pas sûr, indique est_facture = false.\n"
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt_detection},
+                {"role": "user", "content": f"Classifie ce document :\n\n{texte_brut[:3000]}\n[...]\n{texte_brut[-1000:]}"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+
+        contenu = completion.choices[0].message.content
+        data = json.loads(contenu)
+        return TypeDocument(
+            est_facture=data.get("est_facture", False),
+            type_detecte=data.get("type_detecte", "inconnu"),
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Échec sur Azure ET sur Groq pour la détection du type : {e}"
+        )
+
+
+def _extraire_donnees_groq(texte_brut: str, est_facture: bool):
+    """
+    Fallback : extrait les données structurées via Groq / Llama 3.
+    Utilise le mode JSON et parse manuellement vers le modèle Pydantic.
+    """
+    client = _get_groq_client()
+
+    if est_facture:
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'extraction de données de factures. "
+            "Extrais les informations demandées du texte fourni.\n\n"
+            "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
+            '{"nom_client": "...", "email_client": "...", "montant_total": 123.45, '
+            '"devise": "EUR", "date": "..."}\n\n'
+            "RÈGLES :\n"
+            "- Extrais UNIQUEMENT les informations présentes dans le texte.\n"
+            "- Si une information n'est pas trouvée, mets null.\n"
+            "- N'invente JAMAIS de données.\n"
+            "- Pour le montant, renvoie uniquement la valeur numérique.\n"
+        )
+        schema_class = DonneesFacture
+    else:
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'analyse de documents. "
+            "Extrais les informations clés du texte fourni.\n\n"
+            "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
+            '{"titre_document": "...", "auteur_ou_organisme": "...", "date": "...", '
+            '"resume_contenu": "...", "points_cles": "..."}\n\n'
+            "RÈGLES :\n"
+            "- Extrais UNIQUEMENT les informations présentes dans le texte.\n"
+            "- Si une information n'est pas trouvée, mets null.\n"
+            "- N'invente JAMAIS de données.\n"
+        )
+        schema_class = AnalyseGenerique
+
+    # Troncature adaptée à Groq (contexte plus petit)
+    texte_a_envoyer = texte_brut[:LIMITE_CARACTERES_GROQ]
+
+    try:
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt_systeme},
+                {"role": "user", "content": f"Voici le texte du document :\n\n{texte_a_envoyer}"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+
+        contenu = completion.choices[0].message.content
+        data = json.loads(contenu)
+        return schema_class(**data)
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Échec sur Azure ET sur Groq pour l'extraction des données : {e}"
+        )
+
+
+# =============================================================================
+# 7. Affichage des résultats dans un tableau Rich
 # =============================================================================
 
 def afficher_resultats(donnees, chemin_pdf: str, est_facture: bool):
@@ -472,7 +598,7 @@ def afficher_resultats(donnees, chemin_pdf: str, est_facture: bool):
 
 
 # =============================================================================
-# 7. Point d'entrée principal
+# 8. Point d'entrée principal
 # =============================================================================
 
 def main():
