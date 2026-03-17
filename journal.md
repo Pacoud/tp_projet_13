@@ -101,7 +101,7 @@ _Solution_ :lever une exception ou afficher un message clair et quitter si pas d
 Un autre problème est que si le pdf est trop volumineux, l'API atteindra un dépassement de tokens et cela renvoie une erreur mais assez cryptique.
 
 _Solution_ :
-Il faudrait plutôt afficher un message d'erreur. et ensuite implémenter des API IA de secours
+Il faudrait plutôt afficher un message d'erreur. et ensuite implémenter des API IA de secours (ici llama3-versatile avec groq API)
 
 Dans le cas ou le PDF est protégé par mdp, le cas n'est pas géré et cela renvoie une exception ou renvoie un texte vide.
 
@@ -118,3 +118,46 @@ L'utilisateur peut passer n'importe quel argument en chemin relatif, ça peut et
 _Solution_ implémenter une validation robuste du chemin rentré par l'utilisateur
 
 **Apprentissage** :
+J'ai vérifié et corrigé quand il y en avait besoin la gestion des cas spécifiques, j'ai bien observé la structure du code qui dirigeait l'IA (conditions de réponses du LLM ...) et comment cela fonctionnait, je pourrais le remettre en pratique
+
+## Session 5 - Objectif : Optimiser l'utilisation de tokens et se pencher sur la question d'un MCP (meme si tardif)
+
+Prompt 1:
+combien de token par analyse de document l'IA consomme t-elle ?
+
+**Problèmes anticipés et solutions**
+Actuellement, l'utilisation de tokens par les LLMs utilisés est moyenne, mais je trouve que l'on peut encore optimiser cela et qu'on le devrait. Aussi il y a 2 appels d'API distincts qui se suivent, ce qui est plus gourmand en token que pour un seul. On ne vérifie pas si un fichier a déjà été analysé, il faut le faire dans le futur.
+
+_Solutions_
+-Un MCP (Machine Coding Protocol) permettrait de réduire la consommation de tokens et de rendre l'IA plus optimisée
+-Fusionner les appels d'API en 1 seul réduira aussi
+-Mettre en cache les fichiers déjà scannés pour ne pas redépenser des tokens si ils sont resélectionnés
+
+**Apprentissage**
+Je me suis renseigné sur les MCP et notamment avec de l'aide de L'IA , je ne l'ai pas encore implémenté dans le code mais j'en vois désormais l'utilité surtout pour réduire la consommation de tokens et rendre l'IA plus optimisée dans son travail
+
+Prompt 2
+ok dans ce cas regardons pour l'instant pour la mise en cache des fichiers comment va-t-on procéder ?
+-REPONSE
+Voici le plan pour la mise en cache. L'idée est simple :
+
+Hash SHA256 du PDF → identifiant unique basé sur le contenu du fichier (pas son nom)
+cache_analyses.json → fichier local qui stocke les résultats par hash
+Dans main() : on vérifie le cache avant tout appel API → si trouvé, affichage immédiat sans dépenser un seul token
+
+MOI (je n'ai pas tout compris je demande des clarifications)
+donc on va analyser le SHA256 du fichier, le mettre dans un fichier JSON et le lire avant chaque appel pour voir si on a déjà lu le fichier c'est bien ça ?
+
+REPONSE
+SHA256 du fichier → garantit que si le contenu du PDF change (même nom de fichier différent contenu), le cache ne sera pas réutilisé à tort
+cache_analyses.json → stocke les résultats par hash : type de document + données extraites
+Vérification au début de
+
+main()
+→ si le hash est présent, on affiche directement le résultat sans toucher aux APIs
+
+**Problèmes**
+L'IA s'est heurté à des problèmes de logique pour la mise en cache, je lui ai demandé de multiplier les tests pour voir d'ou venait l'erreur
+Au début, c'était juste une lecture en cache local, il fallait rendre le cache portable
+**Apprentissage**
+J'ai observé la structure du code de la mise en cache et de sa lecture, j'ai compris comment marchait ce procédé que l'IA m'a aidé à faire.

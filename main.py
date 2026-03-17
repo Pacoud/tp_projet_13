@@ -10,6 +10,8 @@ pour extraire des données structurées validées par Pydantic.
 import os
 import sys
 import time
+import hashlib
+import datetime
 
 import json
 import fitz  # PyMuPDF
@@ -122,6 +124,45 @@ GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
 # Limite de caractères envoyés à l'API pour éviter le dépassement de tokens
 LIMITE_CARACTERES = 50000
 LIMITE_CARACTERES_GROQ = 25000  # Groq a des limites plus basses
+
+# Fichier de cache local (ne pas commiter)
+CACHE_FILE = "cache_analyses.json"
+
+
+# =============================================================================
+# Fonctions de mise en cache
+# =============================================================================
+
+def calculer_hash_pdf(chemin_pdf: str) -> str:
+    """
+    Calcule le hash SHA256 du contenu du fichier PDF.
+    Sert d'identifiant unique : si le contenu change, le hash change aussi.
+    """
+    sha256 = hashlib.sha256()
+    with open(chemin_pdf, "rb") as f:
+        for bloc in iter(lambda: f.read(65536), b""):
+            sha256.update(bloc)
+    return sha256.hexdigest()
+
+
+def charger_cache() -> dict:
+    """Charge le fichier cache JSON. Retourne un dict vide si inexistant ou corrompu."""
+    if os.path.isfile(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def sauvegarder_cache(cache: dict) -> None:
+    """Sauvegarde le cache dans le fichier JSON."""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        console.print(f"[bold yellow]⚠  Impossible de sauvegarder le cache : {e}[/bold yellow]")
 
 
 # =============================================================================
@@ -756,6 +797,47 @@ def main():
         )
         sys.exit(1)
 
+    # --- Vérification préliminaire du fichier (avant calcul hash) ---
+    # cache et hash_pdf initialisés ici pour rester en scope jusqu'à la fin de main()
+    cache: dict = {}
+    hash_pdf: str = ""
+
+    if not chemin_pdf.lower().endswith('.pdf') or not os.path.isfile(chemin_pdf):
+        # On laisse extraire_texte_pdf gérer l'erreur détaillée
+        pass
+    else:
+        # --- Vérification dans le cache ---
+        cache = charger_cache()
+        hash_pdf = calculer_hash_pdf(chemin_pdf)
+
+        if hash_pdf in cache:
+            entree = cache[hash_pdf]
+            console.print(
+                Panel(
+                    f"[bold green]📦  Résultat depuis le cache[/bold green]\n"
+                    f"[dim]Ce fichier a déjà été analysé le [/dim]"
+                    f"[cyan]{entree.get('date_analyse', '?')}[/cyan]\n"
+                    f"[dim]Hash SHA256 :[/dim] [dim]{hash_pdf[:16]}...[/dim]\n"
+                    f"[dim]Aucun appel API effectué (0 token consommé).[/dim]",
+                    border_style="green",
+                    expand=False,
+                    padding=(0, 2),
+                )
+            )
+            console.print()
+
+            # Reconstruction des objets Pydantic depuis le cache
+            type_doc_cache = TypeDocument(**entree["type_doc"])
+            if type_doc_cache.est_facture:
+                donnees_cache = DonneesFacture(**entree["donnees"])
+            elif type_doc_cache.est_devis_ou_bc:
+                donnees_cache = DonneesDevisBonCommande(**entree["donnees"])
+            else:
+                donnees_cache = AnalyseGenerique(**entree["donnees"])
+
+            afficher_resultats(donnees_cache, chemin_pdf, type_doc_cache)
+            return  # On quitte main() ici, le travail est fait
+
     # --- Étape 1 : Extraction du texte brut du PDF ---
     try:
         texte_brut = run_with_rect(
@@ -843,6 +925,19 @@ def main():
         sys.exit(1)
 
     console.print("[bold green]✔[/bold green]  Réponse reçue de l'API Azure OpenAI")
+
+    # --- Sauvegarde dans le cache ---
+    try:
+        cache[hash_pdf] = {
+            "chemin_pdf": chemin_pdf,
+            "date_analyse": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type_doc": type_doc.model_dump(),
+            "donnees": donnees.model_dump(),
+        }
+        sauvegarder_cache(cache)
+        console.print("[dim]💾  Résultat sauvegardé dans le cache (prochaine analyse instantanée).[/dim]")
+    except Exception as e:
+        console.print(f"[bold yellow]⚠  Cache non sauvegardé : {e}[/bold yellow]")
 
     # --- Étape 4 : Affichage des résultats ---
     afficher_resultats(donnees, chemin_pdf, type_doc)
