@@ -131,16 +131,29 @@ LIMITE_CARACTERES_GROQ = 25000  # Groq a des limites plus basses
 class TypeDocument(BaseModel):
     """
     Schéma Pydantic utilisé pour la détection du type de document.
-    Un premier appel API léger détermine si le PDF est une facture ou non.
+    Distingue trois catégories principales : facture, devis/bon de commande, ou autre.
     """
     est_facture: bool = Field(
-        description="True si le document est une facture commerciale, False sinon."
+        description=(
+            "True UNIQUEMENT si le document est une facture commerciale émise APRÈS une vente "
+            "(contient un numéro de facture, mention 'facture', montant TTC dû, date d'échéance). "
+            "False sinon."
+        )
+    )
+    est_devis_ou_bc: bool = Field(
+        default=False,
+        description=(
+            "True si le document est un devis ou un bon de commande : "
+            "document AVANT la vente/livraison (contient 'devis', 'bon de commande', "
+            "'offre de prix', 'pro forma', 'purchase order', 'PO', montant estimatif). "
+            "False sinon. Ne peut pas être True en même temps que est_facture."
+        )
     )
     type_detecte: Optional[str] = Field(
         default=None,
         description=(
-            "Type du document détecté en français, ex: 'facture', 'contrat', "
-            "'rapport', 'déclaration fiscale', 'bulletin de paie', 'autre'."
+            "Type précis du document en français : 'facture', 'devis', 'bon de commande', "
+            "'contrat', 'rapport', 'déclaration fiscale', 'bulletin de paie', 'autre'."
         )
     )
 
@@ -176,12 +189,53 @@ class DonneesFacture(BaseModel):
     )
 
 
+class DonneesDevisBonCommande(BaseModel):
+    """
+    Schéma Pydantic pour l'extraction des données d'un devis ou bon de commande.
+    Ces documents précèdent la vente et contiennent une offre de prix ou une commande.
+    """
+    type_document: Optional[str] = Field(
+        default=None,
+        description="Type précis : 'devis', 'bon de commande', 'offre de prix', 'pro forma', etc."
+    )
+    numero_reference: Optional[str] = Field(
+        default=None,
+        description="Numéro de référence du devis ou bon de commande (ex: 'DEV-2024-042', 'BC-001')."
+    )
+    nom_client: Optional[str] = Field(
+        default=None,
+        description="Nom du client ou de l'acheteur."
+    )
+    nom_fournisseur: Optional[str] = Field(
+        default=None,
+        description="Nom du fournisseur ou de l'émetteur du document."
+    )
+    montant_total: Optional[float] = Field(
+        default=None,
+        description="Montant total estimé ou commandé (TTC), en valeur numérique."
+    )
+    devise: Optional[str] = Field(
+        default=None,
+        description="Devise du montant (ex: 'EUR', 'USD', 'GBP'). Si non précisée, renvoyer null."
+    )
+    date_emission: Optional[str] = Field(
+        default=None,
+        description="Date d'émission du document."
+    )
+    date_validite: Optional[str] = Field(
+        default=None,
+        description="Date de validité ou d'expiration du devis (si mentionnée)."
+    )
+    description_prestations: Optional[str] = Field(
+        default=None,
+        description="Résumé des produits, services ou prestations listés dans le document."
+    )
+
+
 class AnalyseGenerique(BaseModel):
     """
-    Schéma Pydantic pour l'analyse de tout document qui n'est pas une facture.
-
-    Les champs couvrent les informations généralement présentes dans
-    n'importe quel document textuel (rapport, contrat, déclaration, etc.).
+    Schéma Pydantic pour l'analyse de tout document qui n'est ni une facture
+    ni un devis/bon de commande : rapport, contrat, déclaration, etc.
     """
 
     titre_document: Optional[str] = Field(
@@ -190,11 +244,20 @@ class AnalyseGenerique(BaseModel):
     )
     auteur_ou_organisme: Optional[str] = Field(
         default=None,
-        description="Nom de l'auteur, de l'organisme ou de l'entité émettrice du document."
+        description=(
+            "PRIORITÉ : Nom de l'auteur, du signataire, de l'organisme ou de l'entité émettrice du document. "
+            "Cherche des mentions comme 'rédigé par', 'auteur', 'signataire', un en-tête, un logo textuel, "
+            "ou une signature en bas de document. Renvoie null uniquement si vraiment introuvable."
+        )
     )
     date: Optional[str] = Field(
         default=None,
-        description="Date mentionnée dans le document (date d'émission, de signature, etc.)."
+        description=(
+            "PRIORITÉ : Date d'émission ou de création du document. "
+            "Cherche des mentions comme 'le', 'date', 'émis le', 'fait à', 'en-tête daté', "
+            "ou toute date en début ou fin de document. Format texte (ex: '15/01/2025'). "
+            "Renvoie null uniquement si vraiment introuvable."
+        )
     )
     resume_contenu: Optional[str] = Field(
         default=None,
@@ -282,16 +345,26 @@ def detecter_type_document(texte_brut: str) -> TypeDocument:
     )
 
     prompt_detection = (
-        "Tu es un assistant expert en classification de documents. "
+        "Tu es un assistant expert en classification de documents commerciaux et administratifs. "
         "On te fournit le texte brut extrait d'un PDF. "
-        "Ta seule mission est de déterminer si ce document est une facture commerciale ou non, "
-        "et d'indiquer quel type de document il s'agit.\n\n"
-        "RÈGLES :\n"
-        "- Une facture contient généralement : un numéro de facture, un montant TTC/HT, "
-        "un client, une date d'échéance, des lignes d'articles ou de services.\n"
-        "- Si tu n'es pas sûr, indique est_facture = false.\n"
-        "- Pour type_detecte, sois précis : 'facture', 'contrat', 'rapport annuel', "
-        "'déclaration fiscale', 'bulletin de paie', 'relevé bancaire', 'autre', etc."
+        "Tu dois classifier précisément ce document selon les règles ci-dessous.\n\n"
+        "RÈGLES DE CLASSIFICATION :\n"
+        "1. FACTURE (est_facture=true, est_devis_ou_bc=false) :\n"
+        "   - Document émis APRÈS une vente ou prestation réalisée.\n"
+        "   - Contient : 'FACTURE', numéro de facture, date d'échéance ou 'À payer avant le', "
+        "     montant TTC exigible.\n"
+        "   - Le paiement est DÛ (obligation de règlement).\n\n"
+        "2. DEVIS ou BON DE COMMANDE (est_facture=false, est_devis_ou_bc=true) :\n"
+        "   - Document émis AVANT la vente/livraison.\n"
+        "   - Contient les mots : 'DEVIS', 'BON DE COMMANDE', 'OFFRE DE PRIX', 'PRO FORMA', "
+        "     'PURCHASE ORDER', 'PO', 'QUOTATION', ou une date de validité de l'offre.\n"
+        "   - Le montant est une ESTIMATION ou une COMMANDE, pas encore dû.\n"
+        "   - IMPORTANT : Un devis ressemble à une facture (lignes de produits, montants) "
+        "     mais il n'y a PAS de mention 'facture' ni d'obligation de paiement immédiate.\n\n"
+        "3. AUTRE (est_facture=false, est_devis_ou_bc=false) :\n"
+        "   - Tout autre document : contrat, rapport, déclaration fiscale, bulletin de paie, etc.\n\n"
+        "Pour type_detecte, sois précis : 'facture', 'devis', 'bon de commande', "
+        "'contrat', 'rapport', 'déclaration fiscale', 'bulletin de paie', 'autre'."
     )
 
     try:
@@ -326,13 +399,14 @@ def detecter_type_document(texte_brut: str) -> TypeDocument:
 # 5. Fonction d'extraction structurée via Azure OpenAI (Structured Outputs)
 # =============================================================================
 
-def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
+def extraire_donnees_structurees(texte_brut: str, type_doc: TypeDocument):
     """
     Envoie le texte brut extrait du PDF à l'API Azure OpenAI et utilise
     les Structured Outputs pour obtenir un objet Pydantic validé.
 
-    - Si est_facture=True  : retourne un objet DonneesFacture
-    - Si est_facture=False : retourne un objet AnalyseGenerique
+    - Si est_facture=True         : retourne un objet DonneesFacture
+    - Si est_devis_ou_bc=True     : retourne un objet DonneesDevisBonCommande
+    - Sinon                       : retourne un objet AnalyseGenerique
     """
     if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
                 AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME]):
@@ -347,7 +421,9 @@ def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
         api_version=AZURE_OPENAI_API_VERSION,
     )
 
-    if est_facture:
+    texte_a_envoyer = texte_brut[:LIMITE_CARACTERES]
+
+    if type_doc.est_facture:
         # --- Chemin FACTURE ---
         prompt_systeme = (
             "Tu es un assistant spécialisé dans l'extraction de données à partir "
@@ -357,10 +433,8 @@ def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
             "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
             "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
             "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
-            "- Pour le montant, renvoie uniquement la valeur numérique (sans symbole €).\n"
+            "- Pour le montant, renvoie uniquement la valeur numérique (sans symbole monétaire).\n"
         )
-        # Troncature si le texte est trop long pour éviter le dépassement de tokens
-        texte_a_envoyer = texte_brut[:LIMITE_CARACTERES]
         message_utilisateur = (
             "Voici le texte brut extrait d'une facture PDF. "
             "Extrais les données demandées :\n\n"
@@ -368,20 +442,44 @@ def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
         )
         schema = DonneesFacture
 
+    elif type_doc.est_devis_ou_bc:
+        # --- Chemin DEVIS / BON DE COMMANDE ---
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'extraction de données à partir "
+            "de devis et bons de commande. On te fournit le texte brut extrait d'un PDF. "
+            "Tu dois extraire les informations demandées.\n\n"
+            "RÈGLES IMPORTANTES :\n"
+            "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
+            "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
+            "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
+            "- Pour le montant, renvoie uniquement la valeur numérique (sans symbole monétaire).\n"
+            "- Pour type_document, indique précisément : 'devis', 'bon de commande', "
+            "  'offre de prix', 'pro forma', etc.\n"
+        )
+        message_utilisateur = (
+            "Voici le texte brut extrait d'un devis ou bon de commande PDF. "
+            "Extrais les données demandées :\n\n"
+            f"{texte_a_envoyer}"
+        )
+        schema = DonneesDevisBonCommande
+
     else:
         # --- Chemin GÉNÉRIQUE ---
         prompt_systeme = (
             "Tu es un assistant spécialisé dans l'analyse de documents textuels. "
-            "On te fournit le texte brut extrait d'un PDF qui n'est pas une facture. "
-            "Tu dois extraire les informations clés de ce document.\n\n"
+            "On te fournit le texte brut extrait d'un PDF qui n'est pas une facture "
+            "ni un devis. Tu dois extraire les informations clés de ce document.\n\n"
+            "PRIORITÉS ABSOLUES (cherche dans tout le document) :\n"
+            "1. auteur_ou_organisme : cherche l'auteur, le signataire, l'organisme émetteur, "
+            "   un en-tête, un logo textuel ou une signature. Renvoie null SEULEMENT si introuvable.\n"
+            "2. date : cherche la date d'émission, de création ou de signature du document "
+            "   (en-tête, bas de page, formule 'fait à...', 'le...'). Renvoie null SEULEMENT si introuvable.\n\n"
             "RÈGLES IMPORTANTES :\n"
             "- Extrais UNIQUEMENT les informations explicitement présentes dans le texte.\n"
             "- Si une information N'EST PAS trouvée dans le texte, renvoie null.\n"
             "- N'INVENTE JAMAIS de données. Aucune hallucination n'est tolérée.\n"
             "- Pour le résumé et les points clés, sois concis et factuel.\n"
         )
-        # Troncature si le texte est trop long pour éviter le dépassement de tokens
-        texte_a_envoyer = texte_brut[:LIMITE_CARACTERES]
         message_utilisateur = (
             "Voici le texte brut extrait d'un document PDF. "
             "Extrais les informations clés :\n\n"
@@ -413,7 +511,7 @@ def extraire_donnees_structurees(texte_brut: str, est_facture: bool):
     except Exception as e:
         # --- Fallback Groq pour l'extraction ---
         console.print(f"[bold yellow]⚠  Azure échoué pour l'extraction, basculement vers Groq...[/bold yellow]")
-        return _extraire_donnees_groq(texte_brut, est_facture)
+        return _extraire_donnees_groq(texte_brut, type_doc)
 
 
 # =============================================================================
@@ -439,14 +537,16 @@ def _detecter_type_document_groq(texte_brut: str) -> TypeDocument:
     client = _get_groq_client()
 
     prompt_detection = (
-        "Tu es un assistant expert en classification de documents. "
-        "On te fournit le texte brut extrait d'un PDF. "
-        "Détermine si ce document est une facture commerciale ou non.\n\n"
-        "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
-        '{"est_facture": true/false, "type_detecte": "facture/contrat/rapport/autre"}\n\n'
-        "RÈGLES :\n"
-        "- Une facture contient : numéro de facture, montant TTC/HT, client, date.\n"
-        "- Si tu n'es pas sûr, indique est_facture = false.\n"
+        "Tu es un assistant expert en classification de documents commerciaux. "
+        "Classifie le document en JSON selon ces règles STRICTES :\n\n"
+        "1. FACTURE : est_facture=true, est_devis_ou_bc=false\n"
+        "   → Document post-vente avec mention 'FACTURE', obligation de paiement, date d'échéance.\n\n"
+        "2. DEVIS/BON DE COMMANDE : est_facture=false, est_devis_ou_bc=true\n"
+        "   → Document pré-vente avec mots 'DEVIS', 'BON DE COMMANDE', 'OFFRE', 'PRO FORMA', "
+        "     'PURCHASE ORDER', ou date de validité de l'offre. Montant estimé, pas encore dû.\n\n"
+        "3. AUTRE : est_facture=false, est_devis_ou_bc=false\n\n"
+        "Réponds UNIQUEMENT en JSON : "
+        '{"est_facture": bool, "est_devis_ou_bc": bool, "type_detecte": "facture|devis|bon de commande|autre"}'
     )
 
     try:
@@ -464,6 +564,7 @@ def _detecter_type_document_groq(texte_brut: str) -> TypeDocument:
         data = json.loads(contenu)
         return TypeDocument(
             est_facture=data.get("est_facture", False),
+            est_devis_ou_bc=data.get("est_devis_ou_bc", False),
             type_detecte=data.get("type_detecte", "inconnu"),
         )
     except Exception as e:
@@ -472,27 +573,34 @@ def _detecter_type_document_groq(texte_brut: str) -> TypeDocument:
         )
 
 
-def _extraire_donnees_groq(texte_brut: str, est_facture: bool):
+def _extraire_donnees_groq(texte_brut: str, type_doc: TypeDocument):
     """
     Fallback : extrait les données structurées via Groq / Llama 3.
-    Utilise le mode JSON et parse manuellement vers le modèle Pydantic.
+    Utilise le mode JSON et parse manuellement vers le modèle Pydantic approprié.
     """
     client = _get_groq_client()
 
-    if est_facture:
+    if type_doc.est_facture:
         prompt_systeme = (
             "Tu es un assistant spécialisé dans l'extraction de données de factures. "
             "Extrais les informations demandées du texte fourni.\n\n"
             "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
             '{"nom_client": "...", "email_client": "...", "montant_total": 123.45, '
             '"devise": "EUR", "date": "..."}\n\n'
-            "RÈGLES :\n"
-            "- Extrais UNIQUEMENT les informations présentes dans le texte.\n"
-            "- Si une information n'est pas trouvée, mets null.\n"
-            "- N'invente JAMAIS de données.\n"
-            "- Pour le montant, renvoie uniquement la valeur numérique.\n"
+            "RÈGLES : extrais uniquement ce qui est présent, mets null si absent, n'invente rien."
         )
         schema_class = DonneesFacture
+    elif type_doc.est_devis_ou_bc:
+        prompt_systeme = (
+            "Tu es un assistant spécialisé dans l'extraction de données de devis et bons de commande. "
+            "Extrais les informations demandées du texte fourni.\n\n"
+            "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
+            '{"type_document": "devis", "numero_reference": "...", "nom_client": "...", '
+            '"nom_fournisseur": "...", "montant_total": 123.45, "devise": "EUR", '
+            '"date_emission": "...", "date_validite": "...", "description_prestations": "..."}\n\n'
+            "RÈGLES : extrais uniquement ce qui est présent, mets null si absent, n'invente rien."
+        )
+        schema_class = DonneesDevisBonCommande
     else:
         prompt_systeme = (
             "Tu es un assistant spécialisé dans l'analyse de documents. "
@@ -500,10 +608,9 @@ def _extraire_donnees_groq(texte_brut: str, est_facture: bool):
             "Réponds UNIQUEMENT en JSON avec ce format exact :\n"
             '{"titre_document": "...", "auteur_ou_organisme": "...", "date": "...", '
             '"resume_contenu": "...", "points_cles": "..."}\n\n'
-            "RÈGLES :\n"
-            "- Extrais UNIQUEMENT les informations présentes dans le texte.\n"
-            "- Si une information n'est pas trouvée, mets null.\n"
-            "- N'invente JAMAIS de données.\n"
+            "PRIORITÉS : cherche en premier l'auteur/organisme émetteur ET la date d'émission "
+            "dans tout le document (en-têtes, signatures, bas de page). "
+            "Mets null uniquement si vraiment introuvable, n'invente rien."
         )
         schema_class = AnalyseGenerique
 
@@ -535,10 +642,10 @@ def _extraire_donnees_groq(texte_brut: str, est_facture: bool):
 # 7. Affichage des résultats dans un tableau Rich
 # =============================================================================
 
-def afficher_resultats(donnees, chemin_pdf: str, est_facture: bool):
+def afficher_resultats(donnees, chemin_pdf: str, type_doc: TypeDocument):
     """
     Affiche les données extraites dans un joli tableau Rich.
-    L'affichage s'adapte selon que le document est une facture ou non.
+    L'affichage s'adapte selon le type de document : facture, devis/BC, ou générique.
     """
 
     console.print()
@@ -560,19 +667,31 @@ def afficher_resultats(donnees, chemin_pdf: str, est_facture: bool):
     def val(v):
         return str(v) if v is not None else "[dim italic]Non trouvé[/dim italic]"
 
-    if est_facture:
+    def montant_str(montant, devise):
+        if montant is None:
+            return "[dim italic]Non trouvé[/dim italic]"
+        symbole = {"EUR": "€", "USD": "$", "GBP": "£"}.get(
+            (devise or "").upper(), devise or "€"
+        )
+        return f"[bold green]{montant:,.2f} {symbole}[/bold green]"
+
+    if type_doc.est_facture:
         # --- Affichage spécifique FACTURE ---
         table.add_row("👤  Nom client",   val(donnees.nom_client))
         table.add_row("✉  E-mail",        val(donnees.email_client))
-        # Affichage du montant avec la devise détectée par l'IA
-        symbole_devise = {"EUR": "€", "USD": "$", "GBP": "£"}.get(
-            (donnees.devise or "").upper(), donnees.devise or "€"
-        )
-        table.add_row("💶  Montant TTC",
-                      f"[bold green]{donnees.montant_total:,.2f} {symbole_devise}[/bold green]"
-                      if donnees.montant_total is not None
-                      else "[dim italic]Non trouvé[/dim italic]")
+        table.add_row("💶  Montant TTC",  montant_str(donnees.montant_total, donnees.devise))
         table.add_row("📅  Date",         val(donnees.date))
+
+    elif type_doc.est_devis_ou_bc:
+        # --- Affichage spécifique DEVIS / BON DE COMMANDE ---
+        table.add_row("📋  Type",               val(donnees.type_document))
+        table.add_row("🔢  Référence",          val(donnees.numero_reference))
+        table.add_row("👤  Client",             val(donnees.nom_client))
+        table.add_row("🏢  Fournisseur",        val(donnees.nom_fournisseur))
+        table.add_row("💰  Montant estimé",     montant_str(donnees.montant_total, donnees.devise))
+        table.add_row("📅  Date d'émission",    val(donnees.date_emission))
+        table.add_row("⏳  Validité jusqu'au",  val(donnees.date_validite))
+        table.add_row("📝  Prestations",        val(donnees.description_prestations))
 
     else:
         # --- Affichage générique ---
@@ -695,6 +814,8 @@ def main():
     # Affichage du type détecté
     if type_doc.est_facture:
         badge = "[bold green]🧾  Facture[/bold green]"
+    elif type_doc.est_devis_ou_bc:
+        badge = f"[bold cyan]📋  {type_doc.type_detecte or 'Devis / Bon de commande'}[/bold cyan]"
     else:
         badge = f"[bold yellow]📂  {type_doc.type_detecte or 'Document générique'}[/bold yellow]"
 
@@ -712,7 +833,7 @@ def main():
     try:
         donnees = run_with_rect(
             "Analyse par Azure OpenAI  (gpt-4o)",
-            extraire_donnees_structurees, texte_brut, type_doc.est_facture
+            extraire_donnees_structurees, texte_brut, type_doc
         )
     except ValueError as e:
         console.print(f"\n[bold red]❌  Erreur de configuration :[/bold red] {e}")
@@ -724,7 +845,7 @@ def main():
     console.print("[bold green]✔[/bold green]  Réponse reçue de l'API Azure OpenAI")
 
     # --- Étape 4 : Affichage des résultats ---
-    afficher_resultats(donnees, chemin_pdf, type_doc.est_facture)
+    afficher_resultats(donnees, chemin_pdf, type_doc)
 
 
 if __name__ == "__main__":
