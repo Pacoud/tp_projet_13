@@ -161,3 +161,10 @@ L'IA s'est heurté à des problèmes de logique pour la mise en cache, je lui ai
 Au début, c'était juste une lecture en cache local, il fallait rendre le cache portable
 **Apprentissage**
 J'ai observé la structure du code de la mise en cache et de sa lecture, j'ai compris comment marchait ce procédé que l'IA m'a aidé à faire.
+
+### Conclusion
+
+Je dirais pour conclure sur cette experience que j'ai acquis plusieurs nouvellles méthodes de travail et de résolution de problèmes, surtout grace à l'IA.J'ai appris de nouvelles notions intéressantes à réutiliser comme la msie en cache et la gestion des erreurs et cas limites.
+Le code lui marche plutot bien, il gère bien les factures principalement, mais il y a encore des améliorations à apporter, notamment sur la gestion des autres types de documents (meme si il y a eu des améliorations) et sur l'optimisation des tokens.
+On a un nom d'auteur, des détails sur les factures, une bonne détection du type de document.
+Implémenter un MCP est quelque chose que j'aurais du faire dès le début mais meme si je ne l'ai pas implémenté, le projet m'a donné l'opportunité de comprendre comment cela fonctionnait et de voir son utilité.
